@@ -172,7 +172,7 @@ if start_btn:
 with tab_results:
     cases = st.session_state.test_cases
     if not cases:
-        st.info("暂无测试用例，请先上传文件并点击"开始分析"")
+        st.info('暂无测试用例，请先上传文件并点击"开始分析"')
     else:
         # 筛选器
         col_f1, col_f2, col_f3 = st.columns(3)
