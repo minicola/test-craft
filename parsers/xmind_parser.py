@@ -12,10 +12,12 @@ def parse_xmind(file_path: str) -> list[dict]:
     return test_cases
 
 
-def _extract_cases(node: dict, path: list[str], cases: list[dict]):
+def _extract_cases(node, path: list[str], cases: list[dict]):
     """递归遍历 XMind 节点树，叶子节点视为用例。"""
-    title = node.get("title", "").strip()
-    children = node.get("topics", [])
+    if not isinstance(node, dict):
+        return
+    title = (node.get("title") or "").strip()
+    children = node.get("topics") or []
 
     if not children and title:
         # 叶子节点 = 测试用例
