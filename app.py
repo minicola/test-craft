@@ -1,7 +1,9 @@
 import base64
 import io
 import os
+import shutil
 import tempfile
+import zipfile
 
 import streamlit as st
 
@@ -46,8 +48,8 @@ with tab_upload:
     with col1:
         st.subheader("历史测试用例")
         history_files = st.file_uploader(
-            "上传 XMind 或 Excel 文件",
-            type=["xmind", "xlsx"],
+            "上传 XMind / Excel 文件或包含它们的 ZIP 压缩包",
+            type=["xmind", "xlsx", "zip"],
             accept_multiple_files=True,
             key="history",
         )
@@ -66,7 +68,7 @@ with tab_upload:
 
     with col3:
         st.subheader("JAR 文件")
-        jar_file = st.file_uploader("上传 JAR 文件", type=["jar"], key="jar")
+        jar_file = st.file_uploader("上传 JAR 文件或包含 JAR 的 ZIP 压缩包", type=["jar", "zip"], key="jar")
 
     st.divider()
     start_btn = st.button("开始分析", type="primary", use_container_width=True)
@@ -102,16 +104,33 @@ if start_btn:
             existing_cases = []
             if history_files:
                 for f in history_files:
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.name)[1]) as tmp:
-                        tmp.write(f.read())
-                        tmp_path = tmp.name
-                    try:
-                        if f.name.endswith(".xmind"):
-                            existing_cases.extend(parse_xmind(tmp_path))
-                        elif f.name.endswith(".xlsx"):
-                            existing_cases.extend(parse_excel(tmp_path))
-                    finally:
-                        os.unlink(tmp_path)
+                    if f.name.lower().endswith(".zip"):
+                        # 解压 ZIP，遍历其中的 xmind/xlsx 文件
+                        with tempfile.TemporaryDirectory(prefix="testcraft_zip_") as zip_dir:
+                            zip_path = os.path.join(zip_dir, f.name)
+                            with open(zip_path, "wb") as zf:
+                                zf.write(f.read())
+                            with zipfile.ZipFile(zip_path, "r") as zobj:
+                                zobj.extractall(zip_dir)
+                            for root, _dirs, files in os.walk(zip_dir):
+                                for fname in files:
+                                    fpath = os.path.join(root, fname)
+                                    lower = fname.lower()
+                                    if lower.endswith(".xmind"):
+                                        existing_cases.extend(parse_xmind(fpath))
+                                    elif lower.endswith(".xlsx"):
+                                        existing_cases.extend(parse_excel(fpath))
+                    else:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(f.name)[1]) as tmp:
+                            tmp.write(f.read())
+                            tmp_path = tmp.name
+                        try:
+                            if f.name.endswith(".xmind"):
+                                existing_cases.extend(parse_xmind(tmp_path))
+                            elif f.name.endswith(".xlsx"):
+                                existing_cases.extend(parse_excel(tmp_path))
+                        finally:
+                            os.unlink(tmp_path)
                 log_progress(f"解析完成，共 {len(existing_cases)} 条历史用例")
 
             # Step 2: 处理截图
@@ -127,20 +146,52 @@ if start_btn:
             # Step 3: 反编译 JAR
             progress_bar.progress(30)
             code_chunks = []
+            all_classes = []
             if jar_file:
                 log_progress("正在反编译 JAR 文件...")
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".jar") as tmp:
-                    tmp.write(jar_file.read())
-                    jar_path = tmp.name
+                jar_paths_to_process = []
+                tmp_cleanup = []
                 try:
-                    decompiled_dir = decompile_jar(jar_path)
-                    classes = extract_key_classes(decompiled_dir)
-                    code_chunks = prepare_code_for_ai(classes)
-                    log_progress(f"反编译完成，提取 {len(classes)} 个关键类，分为 {len(code_chunks)} 个代码块")
+                    if jar_file.name.lower().endswith(".zip"):
+                        # 解压 ZIP，收集其中所有 .jar 文件
+                        zip_tmp_dir = tempfile.mkdtemp(prefix="testcraft_jarzip_")
+                        tmp_cleanup.append(("dir", zip_tmp_dir))
+                        zip_path = os.path.join(zip_tmp_dir, jar_file.name)
+                        with open(zip_path, "wb") as zf:
+                            zf.write(jar_file.read())
+                        with zipfile.ZipFile(zip_path, "r") as zobj:
+                            zobj.extractall(zip_tmp_dir)
+                        for root, _dirs, files in os.walk(zip_tmp_dir):
+                            for fname in files:
+                                if fname.lower().endswith(".jar"):
+                                    jar_paths_to_process.append(os.path.join(root, fname))
+                        log_progress(f"ZIP 中发现 {len(jar_paths_to_process)} 个 JAR 文件")
+                    else:
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".jar")
+                        tmp.write(jar_file.read())
+                        tmp.close()
+                        jar_paths_to_process.append(tmp.name)
+                        tmp_cleanup.append(("file", tmp.name))
+
+                    for jp in jar_paths_to_process:
+                        try:
+                            decompiled_dir = decompile_jar(jp)
+                            classes = extract_key_classes(decompiled_dir)
+                            all_classes.extend(classes)
+                            log_progress(f"反编译 {os.path.basename(jp)} 完成，提取 {len(classes)} 个关键类")
+                        except Exception as e:
+                            log_progress(f"反编译 {os.path.basename(jp)} 失败: {e}（已跳过）")
+
+                    code_chunks = prepare_code_for_ai(all_classes)
+                    log_progress(f"共提取 {len(all_classes)} 个关键类，分为 {len(code_chunks)} 个代码块")
                 except Exception as e:
-                    log_progress(f"JAR 反编译失败: {e}（将跳过代码分析）")
+                    log_progress(f"JAR 处理失败: {e}（将跳过代码分析）")
                 finally:
-                    os.unlink(jar_path)
+                    for kind, path in tmp_cleanup:
+                        if kind == "file":
+                            os.unlink(path)
+                        elif kind == "dir":
+                            shutil.rmtree(path, ignore_errors=True)
 
             # Step 4: AI 分析
             progress_bar.progress(40)
